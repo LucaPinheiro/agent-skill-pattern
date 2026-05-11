@@ -1,0 +1,500 @@
+---
+name: skill-expert-builder
+description: Use when creating a new expertise skill for a library, framework, SDK, or technical tool — handles autonomous source collection, multi-file structure, and quality validation
+---
+
+# Skill Expert Builder (v3.0.0)
+
+**Creating expertise skills IS Test-Driven Development applied to knowledge curation.**
+
+Creates skills at the **project level** (`<project-root>/.claude/skills/{topico}-expert/`), never global. Adapts output depth (flat/medium/deep) and style (expert/tutorial) to the topic.
+
+Argument: $ARGUMENTS
+
+**REQUIRED BACKGROUND:** Skills follow RED-GREEN-REFACTOR. Skill content without research is worse than no skill.
+
+## Iron Law
+
+```
+NO SKILL WITHOUT RESEARCH FIRST.
+NO SKILL WITHOUT A FAILING BASELINE.
+NO SKILL WITHOUT QUALITY GATES PASSED.
+```
+
+Write content before researching? Delete it. Restart.
+Skip baseline? You don't know what gap you're filling.
+Skip quality gates? You shipped untested process docs.
+
+**No exceptions:**
+- Not for "simple libraries I already know"
+- Not for "the user is in a hurry"
+- Not for "Context7 has it covered"
+- Your training data may be stale. Research current sources anyway.
+
+**Violating the letter of these rules is violating the spirit.**
+
+## Process
+
+```
+Understand → Research → Baseline → Plan → Generate → Test → Deploy
+   ↑                                          ↓
+   └────────── loophole found ───────────────┘
+```
+
+1. **Understand** — Topic, stacks, mode, style
+2. **Research** — Collect sources (mandatory, with fallback)
+3. **Baseline (RED)** — What does an agent get wrong without this skill?
+4. **Plan** — Structure proposal, user confirms
+5. **Generate (GREEN)** — Build the skill
+6. **Test (REFACTOR)** — Router test + quality gates
+7. **Deploy** — Validate + report
+
+## Inputs
+
+- Topic (required)
+- Stacks of interest (optional)
+- Additional URLs (optional)
+- Mode (optional): `flat` / `medium` / `deep` / `auto` (default)
+- Style (optional): `expert` (default) / `tutorial`
+
+## Modes
+
+### `flat` — Single-file
+
+For small/focused topics: single function, decorator, lib < 500 LOC, trivial SDK.
+
+Output: one `SKILL.md` in `.claude/skills/{topico}-expert/` containing:
+- Frontmatter
+- Version header (builder + lib + date)
+- Setup mínimo
+- API/uso essencial
+- 3-5 exemplos inline
+- Troubleshooting (3-5 pontos)
+- Princípios não-negociáveis
+- Link to source
+
+Target: 150-400 lines. Cap: 600. Exceeding cap → propose upgrade to `medium`.
+
+### `medium` — Router + essential folders
+
+For medium topics with 2-4 distinct areas.
+
+```
+{topico}-expert/
+├── SKILL.md                    # router + core concepts inline
+├── references/
+│   ├── api-reference.md
+│   └── troubleshooting.md
+└── examples/
+    ├── README.md
+    └── 01-{n}-*.{ext}          # 3-7 curated
+```
+
+### `deep` — Full structure
+
+For large/critical libs with multiple stack integrations, production patterns, breaking changes.
+
+```
+{topico}-expert/
+├── SKILL.md                          # Router
+├── references/
+│   ├── core-concepts.md
+│   ├── api-reference.md
+│   ├── configuration.md
+│   ├── integrations/{stack}.md       # one per relevant stack
+│   ├── troubleshooting.md
+│   └── changelog.md
+├── examples/
+│   ├── README.md
+│   └── {NN-name}.{ext}               # 5-10 curated
+├── recipes/{recipe-name}.md          # 5-10 production flows
+└── snippets/
+    ├── boilerplate.{ext}
+    ├── env-template.md
+    └── common-patterns.{ext}
+```
+
+Optional extra folders (Phase 4 proposes if content justifies):
+`migration-guides/`, `benchmarks/`, `comparison/`, `security/`
+
+### Auto-detection heuristic
+
+| Signal | flat | medium | deep |
+|---|---|---|---|
+| Repo size | < 1k LOC | 1k-10k | > 10k |
+| Docs sections | 1-2 | 3-8 | 10+ |
+| Public API | < 10 | 10-30 | > 30 |
+| Stack integrations | 0 | 1-3 | 4+ |
+| Recent breaking changes | No | Maybe | Yes |
+
+Heuristic guides, user confirms at Checkpoint 1.
+
+## Style
+
+### `expert` (default)
+Skip onboarding. Direct: "Para X, faça Y. Comum errar Z." Assume context.
+
+### `tutorial`
+Include "Primeiros passos". Gradual complexity. More hand-holding in troubleshooting.
+
+Auto-propose `tutorial` if: lib < 1 year old, small community, or user signals inexperience ("nunca usei"). Else `expert`.
+
+## Description Rules — Triggers ONLY
+
+**CRITICAL.** Description must contain triggers only, not workflow summaries:
+
+```yaml
+# BAD: Summarizes workflow — agent shortcuts the skill body
+description: Expert in Traceloop — handles span instrumentation, exporter setup, langchain integration
+
+# GOOD: Triggers only — agent reads the skill content
+description: Use when instrumenting LLM applications with Traceloop, configuring exporters, or debugging missing spans
+```
+
+Why: empirical testing shows agents follow verbose descriptions instead of reading the SKILL.md content. Triggers-only forces the agent into the body.
+
+Apply to BOTH this builder's output skills AND inside every recipe/reference frontmatter.
+
+## Mandatory Research — Phase 2
+
+**Before writing anything**, collect current sources. Stale skills are worse than no skill.
+
+### Tier 1 — Structured tools (prefer)
+
+| Tool | When |
+|---|---|
+| `mcp__context7` (`resolve-library-id` → `query-docs`) | Any indexed library |
+| `web_search` | Discover URLs (docs, repos, examples) |
+| `web_fetch` | Fetch identified URLs |
+
+### Tier 2 — Shell fallback (ALWAYS available, first-class)
+
+Use bash + curl when Tier 1 unavailable or returns junk. Not a desperate fallback — a real path.
+
+**Source discovery:**
+```bash
+# DuckDuckGo HTML (no JS, returns direct links)
+curl -sL --max-time 30 \
+  "https://html.duckduckgo.com/html/?q=TOPIC+official+docs" \
+  -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36" \
+  | grep -oE 'href="https?://[^"]+"' | head -20
+
+# GitHub search (public, rate-limited but works)
+curl -sL --max-time 30 \
+  "https://api.github.com/search/repositories?q=TOPIC&sort=stars&order=desc" \
+  | jq '.items[] | {name: .full_name, stars: .stargazers_count, url: .html_url}' \
+  | head -20
+
+# Repo README
+curl -sL --max-time 30 \
+  "https://raw.githubusercontent.com/{org}/{repo}/main/README.md"
+# Fallback if main 404:
+curl -sL --max-time 30 \
+  "https://raw.githubusercontent.com/{org}/{repo}/master/README.md"
+```
+
+**Doc content (chain conversions):**
+```bash
+curl -sL --max-time 30 "https://docs.example.com/page" \
+  -A "Mozilla/5.0" -o /tmp/page.html
+
+pandoc /tmp/page.html -t markdown -o /tmp/page.md \
+  || lynx -dump -nolist /tmp/page.html > /tmp/page.txt \
+  || sed 's/<[^>]*>//g' /tmp/page.html > /tmp/page.txt
+```
+
+**GitHub examples:**
+```bash
+curl -sL --max-time 30 \
+  "https://api.github.com/repos/{org}/{repo}/contents/examples" \
+  | jq '.[] | {name: .name, download_url: .download_url}'
+
+curl -sL --max-time 30 \
+  "https://raw.githubusercontent.com/{org}/{repo}/main/examples/foo.py" \
+  -o /tmp/raw/foo.py
+
+curl -sL --max-time 30 \
+  "https://api.github.com/repos/{org}/{repo}/releases?per_page=10" \
+  | jq '.[] | {tag: .tag_name, date: .published_at, body: .body}'
+```
+
+**Package registries:**
+```bash
+curl -sL --max-time 30 "https://pypi.org/pypi/{package}/json" \
+  | jq '{version: .info.version, summary: .info.summary, home: .info.home_page}'
+
+curl -sL --max-time 30 "https://registry.npmjs.org/{package}" \
+  | jq '{version: ."dist-tags".latest, description: .description, repo: .repository.url}'
+```
+
+### Tier 3 — Last resort
+
+If Tier 1 and Tier 2 both fail:
+- Report **explicitly** which methods were tried and why each failed
+- Ask user for URLs/content OR abort
+- **Never** hallucinate. Missing source = no skill.
+
+### Universal collection rules
+
+- Realistic User-Agent (`-A "Mozilla/5.0 ..."`) — bare curl gets 403
+- `-sL` (silent + follow redirects)
+- `--max-time 30` on every curl
+- Save to `.claude/skills/{topico}-expert/_raw/` before processing
+- Detect junk: "Cloudflare", "Access Denied", "captcha" in HTML → try alternative
+- 429: wait 5s, retry once; if fails, mark source unavailable
+- Compute **quality score** per source (see below) before processing
+
+### Quality score per source
+
+```
+quality_score = combine({
+  density: useful_content / total_size,
+  has_code_blocks: parseable ``` blocks present,
+  has_structured_headings: # ## ### consistent,
+  navigation_noise_ratio: menu/footer lines / total,
+  encoding_issues: mojibake, unconverted HTML entities
+})
+```
+
+Thresholds:
+- `>= 0.7` — accept
+- `0.4-0.7` — accept with warning, flag for review
+- `< 0.4` — reject, try alternative
+
+If ALL sources for a critical topic stay < 0.4 → escalate to Tier 3.
+
+## Baseline — Phase 3 (RED)
+
+Before generating, understand what an agent gets wrong WITHOUT this skill:
+
+- Identify common mistakes, API misuse, outdated patterns from researched sources
+- What gaps exist in default training knowledge?
+- What patterns from examples contradict "obvious" approaches?
+- What troubleshooting items appear repeatedly in issues/FAQs?
+
+Document these. They become the troubleshooting and "common mistakes" content.
+
+## Plan — Phase 4
+
+Produce mode-specific plan:
+- `flat`: SKILL.md outline (sections + bullets)
+- `medium`: tree + 1 line justifying each file
+- `deep`: full tree + 1 line per file + recipes list + stack integrations + extra folders if justified
+
+Across all modes, identify:
+- Core concepts (5-15)
+- Subtopics by area
+- Stack integrations (one entry per relevant stack)
+- Patterns/anti-patterns observed in actual code
+- Troubleshooting points (from real issues/FAQs)
+- Production recipes
+
+**CHECKPOINT 1**: present sources + collection methods + quality scores + complexity signals + proposed mode/style + detected stacks + failures. User confirms or adjusts.
+
+**CHECKPOINT 2**: present plan with size estimates. User can add/remove items, change mode/style (replan), or request depth adjustments.
+
+## Generate — Phase 5 (GREEN)
+
+Sizes by mode:
+- `flat`: SKILL.md 150-400 lines (cap 600)
+- `medium`: SKILL.md 100-250 lines; references 100-400 lines
+- `deep`: SKILL.md 100-300 lines (cap 500); references 200-500 lines (cap 800, split if exceeded); 5-10 examples; 5-10 recipes; ready-to-paste snippets
+
+### Universal generation rules
+
+1. **Frontmatter description = triggers only** (rule above)
+2. **Version header** at top: builder version + lib version + date
+3. **Non-negotiable principles**: 3-7 actionable rules (imperative, no vagueness like "use best practices")
+4. **Curation, not copy**: paraphrase docs, condense; clean example boilerplate
+5. **File justification** (medium/deep): each file has "Quando ler este arquivo" header
+6. **Technical density**: code > prose, no fluff
+7. **Language**: PT-BR content, English code comments
+8. **Source attribution**: links to original docs at end of each reference
+9. **Licenses**: GitHub example headers preserve license attribution
+10. **Style respected**: expert skips onboarding; tutorial includes
+
+### One excellent example beats five mediocre
+
+For technique/integration skills, prefer one fully runnable, well-commented example over multiple half-baked variations. Multi-language examples dilute quality. Pick the dominant language of the topic.
+
+### Dynamic upgrade/downgrade
+
+If during generation the chosen mode is straining (flat overflowing 600 lines, deep producing near-empty files), pause and propose mode change instead of forcing a bad result.
+
+## Test — Phase 6 (REFACTOR)
+
+### Quality Gates (mandatory checklist)
+
+Before Checkpoint 3, validate ALL. Any fail → fix and revalidate.
+
+```
+[ ] Description matches intent in < 200 chars
+[ ] Description is TRIGGERS ONLY (no workflow summary)
+[ ] Description starts with "Use when..." or equivalent actionable
+[ ] SKILL.md has "Quando usar X" section with >= 3 testable rules
+[ ] Every referenced file is pointed to by >= 1 when-to-use rule
+[ ] No orphan files (referenced from nowhere)
+[ ] Every example has header: context, what it demonstrates, min deps
+[ ] Non-negotiable principles are actionable (imperatives, no vagueness)
+[ ] Troubleshooting covers REAL errors from sources (not invented)
+[ ] Lib version visible in first 10 lines of SKILL.md
+[ ] Builder version in version header
+[ ] YAML frontmatter parseable (name + description present)
+[ ] Sizes respect mode caps
+[ ] Source quality score average >= 0.6
+```
+
+### Router Test (medium/deep only)
+
+Validate the router empirically before Checkpoint 3:
+
+1. Generate 5-10 representative questions covering the topic (conceptual, debug, integration, production, edge cases)
+2. For each, simulate: "If a user asked this, which file does the SKILL.md router point to?"
+3. Validate:
+   - Routing is deterministic (not "all files")
+   - Pointed file actually covers the question
+   - Distribution is balanced (no single file catching 90%)
+
+If >= 2 questions fail routing:
+- Refine SKILL.md (more specific rules)
+- Or consolidate/split files
+- Re-run test
+
+Report Router Test results in Checkpoint 3.
+
+### Rationalization Table
+
+Skill must include a section anticipating common rationalizations for skipping it:
+
+```markdown
+| Excuse | Reality |
+|--------|---------|
+| "Vou ler depois" | Depois = nunca. Lê agora. |
+| "Já sei o básico dessa lib" | A skill cobre o que você esqueceu. |
+| "É só uma instrumentação rápida" | Quick patches viram dívida técnica. |
+```
+
+Tailor 3-5 entries to the specific topic.
+
+**CHECKPOINT 3**: present:
+- Final tree (or single file if flat)
+- Sizes
+- Full SKILL.md preview
+- Preview of 1 example + (if applicable) 1 reference + 1 recipe
+- Quality Gates checklist (✓/✗)
+- Router Test results (if medium/deep)
+
+User confirms or requests adjustments.
+
+## Deploy — Phase 7
+
+- Validate parseable frontmatter
+- Medium/deep: generate `INDEX.md` with file map + searchable tags
+- Clean `_raw/`
+- Final report:
+  - Path
+  - Mode + style
+  - Builder version + lib version
+  - File count / total lines
+  - Collection methods + average quality scores
+  - Quality Gates results
+  - Router Test results
+  - Git command: `git add .claude/skills/{topico}-expert`
+
+## Refresh vs Rebuild Policy
+
+When skill already exists in `.claude/skills/{topico}-expert/`, offer:
+
+### `refresh` — Surgical update preserving customizations
+
+**Always regenerate** (sourced from docs, no user value):
+- `references/api-reference.md`
+- `references/core-concepts.md`
+- `references/changelog.md`
+- `references/configuration.md`
+- `references/integrations/{stack}.md`
+- Examples with `# Source: official-repo` header
+
+**Always preserve** (user-created/customized):
+- `recipes/*.md`
+- `snippets/*.md`
+- Files with `# Custom: true` header (convention)
+- `INDEX.md` if edited (detect via diff)
+
+**Smart merge**:
+- `references/troubleshooting.md` — preserve sections marked `<!-- USER ADDITIONS -->`
+- `SKILL.md` — preserve "Custom Rules" section if exists
+
+Before refresh:
+1. Full backup to `.claude/skills/.backups/{topico}-expert-{timestamp}/`
+2. Apply rules
+3. Report exactly what was updated, preserved, merged
+
+### `rebuild` — Full overwrite
+
+Deletes everything (after backup) and regenerates. Use when skill is severely outdated or generated by very old builder.
+
+### `migrate` — Builder version upgrade
+
+If existing skill was generated by `< v3.0.0`:
+- Read current structure
+- Identify gaps vs v3.0.0 (missing version headers, quality gates, etc)
+- Regenerate ONLY missing/divergent parts
+- More conservative than refresh — touches only what changed between builder versions
+
+### `abort`
+
+Cancel.
+
+## Red Flags — STOP and Restart
+
+- Writing skill content before researching current sources
+- Copying API patterns from training data without verification
+- Description summarizes workflow instead of triggers
+- Skipping baseline analysis (no understanding of what's wrong without skill)
+- Multiple mediocre examples instead of one excellent
+- Skipping Quality Gates "because it's a simple skill"
+- Skipping Router Test "because medium/deep is overkill"
+- "Já conheço essa lib o suficiente" — research anyway
+- "Pesquisa demoraria muito" — stale skills cost more
+- "É só uma referência simples" — references have gaps. Validate retrieval.
+
+**All of these mean: Stop. Research. Restart the phase.**
+
+## Anti-Patterns
+
+| Anti-pattern | Why bad | Do instead |
+|---|---|---|
+| Narrative ("Encontramos que...") | Not reusable | State the pattern directly |
+| Multi-language examples | Dilutes quality | One excellent example |
+| Code inside flowcharts | Can't copy-paste | Use markdown code blocks |
+| Workflow in description | Agent shortcuts skill | Triggers only |
+| Skipping Tier 2 fallback | Builder fails without MCP | curl is first-class |
+| Hallucinating because source quality < 0.4 | Wrong > missing | Escalate to Tier 3 |
+| Orphan files in deep mode | Tokens wasted | Every file pointed to from SKILL.md |
+| Generic principles ("seja consistente") | Not actionable | Imperatives ("sempre rodar `init` antes de import de openai") |
+| Batch-creating skills | Untested = broken | One skill, fully tested, then next |
+
+## Invocation Examples
+
+- `"create a skill expert for traceloop"` — auto-detect everything
+- `"create a flat skill for python pathlib"` — force flat
+- `"deep expert of langgraph for python + fastapi"` — force deep + stacks
+- `"tutorial skill for mem0, never used it"` — force tutorial style
+- `"refresh traceloop-expert"` — refresh policy
+- `"migrate langgraph-expert to v3"` — migrate command
+
+## Final Output
+
+1. Skill in `.claude/skills/{topico}-expert/` (mode + style applied)
+2. INDEX.md (medium/deep)
+3. Backup (refresh/rebuild/migrate)
+4. Report:
+   - Path
+   - Mode + style
+   - Builder + lib versions
+   - Stats (files, lines)
+   - Collection methods + quality scores
+   - Quality Gates checklist
+   - Router Test results (if applicable)
+   - Git command
