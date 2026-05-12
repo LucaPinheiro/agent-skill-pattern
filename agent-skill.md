@@ -21,6 +21,7 @@
 10. [Testes, evals e observabilidade](#10-testes-evals-e-observabilidade)
 11. [Boas práticas e anti-patterns](#11-boas-práticas-e-anti-patterns)
 12. [Roadmap de evolução do template](#12-roadmap-de-evolução-do-template)
+13. [Otimização de latência — Hybrid Router](#13-otimização-de-latência--hybrid-router)
 
 ---
 
@@ -118,6 +119,8 @@ A primeira é a mais robusta e auditável; é o caminho recomendado para o templ
 | Audit trail nativo | Sim — `tool_call` é evento de primeira classe | Não — leitura de arquivo é semanticamente ambígua |
 
 **Decisão.** O template usa **tool `load_skill` como mecanismo central de ativação**, com middleware fino apenas para injetar o catálogo (Nível 1) no system prompt. Filesystem-native fica reservado a um caso muito específico (Nível 3, recursos pesados), e mesmo aí, escondido atrás de uma tool RPC `read_skill_resource(skill_name, path)`, nunca expondo `bash` ao agente.
+
+> **Atualização (revisão 2 do ADR).** A decisão original mantém-se íntegra para o **mecanismo de ativação** (tool `load_skill` continua sendo a peça central). O que evoluiu foi **quem aciona essa tool**: ao invés de ser sempre o LLM (caro em latência por adicionar 1 round-trip por turno), o template adotou um **roteador híbrido com short-circuit determinístico** — keyword/regex matching primeiro, LLM como fallback. A tool `load_skill` permanece como caminho de fallback e como porta de saída quando o usuário muda explicitamente de skill no meio da conversa. Detalhes na §13 (Otimização de latência — Hybrid Router). Os 5 pilares listados abaixo seguem válidos; a auditabilidade ganha o campo `skill_routing_method` no estado para preservar rastreabilidade quando a ativação não é via `tool_call`.
 
 **Razões.**
 
@@ -1077,6 +1080,402 @@ Sugestão de fases para amadurecer o template ao longo do tempo:
 **Fase 5 — Multi-tenant**
 - Catálogo de skills por tenant (cliente da plataforma agentic builder).
 - Marketplace interno de skills reutilizáveis (`_shared/` virando primeiro nível).
+
+---
+
+## 13. Otimização de latência — Hybrid Router
+
+> **Contexto.** A implementação descrita até a §6 funciona, mas paga um pedágio: a tool `load_skill` adiciona **1 round-trip ao LLM por turno** sempre que uma skill precisa ser ativada. Em medições reais do template, isso elevou a latência média de **1.26s/turno (baseline sem skills) para 2.95s/turno** — aumento de ~134%. Esta seção documenta a otimização adotada para reduzir esse custo sem abrir mão de gating, auditoria ou governança.
+
+### 13.1 Diagnóstico do problema
+
+A latência adicional não é o catálogo no system prompt (custo de tokens é marginal). É o **número de chamadas ao LLM**:
+
+```
+Sem skills (1.26s):
+  user → LLM (decide e age) → response
+  → 1 LLM call por turno
+
+Com skills via tool load_skill (2.95s):
+  user → LLM (lê catálogo, decide ativar) → tool_call(load_skill)
+       → handler retorna corpo
+       → LLM (lê corpo, decide tool de domínio) → tool_call(consulta_X)
+       → tool_result
+       → LLM (consolida, responde)
+  → ~3 LLM calls por turno
+```
+
+**2.95 / 1.26 ≈ 2.3x — exatamente o esperado de adicionar um round-trip.** É o LLM atuando como router que cobra esse preço.
+
+### 13.2 Princípio da otimização
+
+A pergunta certa não é "como tornar o LLM-router mais rápido", e sim **"em quantos turnos eu realmente preciso do LLM para decidir a skill?"**.
+
+Em produção com domínio bem definido (jornadas bancárias, atendimento estruturado), uma análise rápida de logs costuma mostrar que **70–85% dos turnos seguem padrões de linguagem previsíveis**. Frases como "contestar pix", "segunda via cartão", "pagar boleto" não precisam de LLM para serem roteadas — um lookup por palavra-chave resolve em milissegundos.
+
+A otimização: **roteamento determinístico em camadas**, em ordem crescente de custo. O LLM só entra quando as camadas baratas falham.
+
+### 13.3 Arquitetura — Hybrid Router com short-circuit
+
+```
+        ┌─ user input
+        │
+        ▼
+   ┌──────────────────────────────────────┐
+   │ ROUTER (executado em before_model)   │
+   │                                      │
+   │  Camada 0: skill já está pinned?     │── sim ─┐
+   │     │ não                                     │
+   │     ▼                                         │
+   │  Camada 1: keyword/regex match?      │── sim ─┤
+   │     │ não                                     │
+   │     ▼                                         │
+   │  Camada 2 (opcional/futuro):                  │
+   │     embedding similarity ≥ threshold │── sim ─┤
+   │     │ não                                     │
+   │     ▼                                         │
+   │  Camada 3 (fallback): catálogo no    │        │
+   │     system prompt → LLM decide via   │        │
+   │     tool_call(load_skill)            │        │
+   │     [caminho original do ADR §2.4]   │        │
+   └──────────────┬───────────────────────┘        │
+                  │                                 │
+                  └─────────────────┬───────────────┘
+                                    ▼
+                ┌────────────────────────────────────┐
+                │ Skill carregada no contexto +      │
+                │ allowed_tool_names atualizado +    │
+                │ active_skill pinned no state +     │
+                │ skill_routing_method registrado    │
+                └─────────────────┬──────────────────┘
+                                  ▼
+                          [LLM agente — 1 call]
+```
+
+**Cobertura típica em produção madura:**
+
+| Camada | Frequência esperada | Latência adicionada vs baseline |
+|---|---|---|
+| 0 — Pinned (skill já ativa na sessão) | 50–70% | ~0 ms (lookup no estado) |
+| 1 — Keyword/regex | 15–30% | 1–5 ms |
+| 2 — Embedding (futuro) | 5–10% | 30–80 ms |
+| 3 — Fallback LLM | 2–10% | 300 ms – 2 s |
+
+### 13.4 Camada 0 — Skill Pinning
+
+Princípio: **uma vez que a skill da jornada foi identificada, não rotear de novo a cada turno.** Em jornadas multi-passo (MED, consórcio, abertura de conta), o usuário fica dentro da mesma skill por 5–15 turnos. Rotear repetidamente é desperdício.
+
+**Estado adicional:**
+
+```python
+class AgentState(TypedDict):
+    # ... campos anteriores
+    active_skill: Optional[str]           # skill pinned na sessão
+    skill_unpin_signal: bool              # sinal de saída (ver abaixo)
+    skill_routing_method: Optional[str]   # auditoria: "pinned" | "keyword" | "embedding" | "llm_tool"
+```
+
+**Quando despinnar:**
+
+1. **Conclusão do workflow.** A skill atinge "Critério de sucesso" (definido no SKILL.md) — a tool final do fluxo despinna ao retornar.
+2. **Mudança explícita de assunto.** Heurística: se o input não casa com nenhuma keyword da skill ativa **e** casa com outra skill, troca.
+3. **Comando explícito do usuário.** Frases tipo "esqueça isso", "quero falar de outra coisa", "voltar ao menu" → unpin.
+4. **Timeout de inatividade.** Sessão sem atividade por X minutos zera skill ativa.
+
+```python
+# src/agent/skills/pinning.py
+UNPIN_KEYWORDS = [
+    "esquece isso", "esqueça isso", "voltar ao menu", "outra coisa",
+    "mudar de assunto", "começar de novo", "cancelar",
+]
+
+def should_unpin(state, user_input: str, registry) -> bool:
+    if not state.get("active_skill"):
+        return False
+    text = user_input.lower()
+
+    # 3) comando explícito
+    if any(kw in text for kw in UNPIN_KEYWORDS):
+        return True
+
+    # 2) outro keyword router casa com skill diferente
+    other_match = keyword_router_excluding(state["active_skill"], user_input, registry)
+    if other_match:
+        return True
+
+    return False
+```
+
+### 13.5 Camada 1 — Keyword/Regex Router
+
+Padrão mais determinístico que existe: substring matching e regex compilada. **1–5 ms**, zero dependência externa.
+
+**Extensão do frontmatter:**
+
+```yaml
+---
+name: pix-disputa-med
+description: ...
+triggers:
+  keywords:
+    - "contestar pix"
+    - "med"
+    - "golpe pix"
+    - "pix indevido"
+    - "devolver pix"
+    - "estorno pix"
+    - "fraude no pix"
+  regex:
+    - "\\b(estornar|devolver|contestar)\\s+(um\\s+|o\\s+)?pix\\b"
+    - "\\bpix\\s+(errado|indevido|por\\s+engano)\\b"
+allowed-tools: [...]
+---
+```
+
+**Loader estendido** — apenas mais um campo no `Skill` dataclass:
+
+```python
+# src/agent/skills/loader.py — adição
+@dataclass
+class Skill:
+    # ... campos anteriores
+    triggers: dict = field(default_factory=dict)
+
+# em parse_skill_file:
+return Skill(
+    # ...
+    triggers=fm.get("triggers", {}) or {},
+)
+```
+
+**Router:**
+
+```python
+# src/agent/skills/keyword_router.py
+import re
+from typing import Optional
+
+
+class KeywordRouter:
+    """Roteador determinístico por keyword + regex.
+
+    Estratégia de score:
+      - keyword multi-palavra ('contestar pix') vale mais que palavra única ('pix').
+      - regex match vale como peso 3.
+      - empate no top1/top2 → devolve None (deixa fallback decidir).
+    """
+
+    def __init__(self, registry):
+        self.registry = registry
+        self._compiled = []
+        for skill in registry.all():
+            triggers = skill.triggers or {}
+            keywords = [k.lower() for k in triggers.get("keywords", [])]
+            patterns = [re.compile(p, re.IGNORECASE) for p in triggers.get("regex", [])]
+            if keywords or patterns:
+                self._compiled.append((skill, keywords, patterns))
+
+    def route(self, user_input: str) -> Optional[str]:
+        text = user_input.lower()
+        scored = []
+        for skill, keywords, patterns in self._compiled:
+            score = 0
+            matched = []
+            for kw in keywords:
+                if kw in text:
+                    score += len(kw.split())
+                    matched.append(("kw", kw))
+            for pat in patterns:
+                if pat.search(user_input):
+                    score += 3
+                    matched.append(("re", pat.pattern))
+            if score > 0:
+                scored.append((score, skill, matched))
+
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # tiebreak conservador: empate → fallback decide
+        if len(scored) > 1 and scored[0][0] == scored[1][0]:
+            return None
+
+        return scored[0][1].name
+```
+
+### 13.6 Middleware com short-circuit completo
+
+```python
+# src/agent/skills/middleware.py — versão otimizada
+class SkillsMiddleware(AgentMiddleware):
+    def __init__(self, registry, all_tools):
+        self.registry = registry
+        self.all_tools = all_tools
+        self.keyword_router = KeywordRouter(registry)
+
+    def before_model(self, state, request):
+        last_user = self._last_user_message(state)
+
+        # ---- Camada 0: Pinning ----
+        if state.get("active_skill") and not should_unpin(state, last_user, self.registry):
+            return self._apply_skill(state["active_skill"], request, method="pinned")
+
+        # se tinha skill ativa mas vai despinar, limpa
+        if state.get("active_skill"):
+            state["active_skill"] = None
+            state["allowed_tool_names"] = None
+
+        # ---- Camada 1: Keyword router ----
+        skill_name = self.keyword_router.route(last_user)
+        if skill_name:
+            return self._apply_skill(skill_name, request, method="keyword", state=state)
+
+        # ---- Camada 3: Fallback LLM (caminho original) ----
+        request.system_prompt = request.system_prompt.replace(
+            "{skill_catalog}", self.registry.catalog()
+        )
+        request.tools = self.all_tools  # tudo liberado, LLM decide
+        state["skill_routing_method"] = "llm_tool"
+        return request
+
+    def _apply_skill(self, name, request, method, state=None):
+        skill = self.registry.get(name)
+        # injeta corpo da skill
+        request.system_prompt = (
+            request.system_prompt.replace("{skill_catalog}", "(skill ativa)")
+            + f"\n\n--- SKILL ATIVA: {skill.name} (v{skill.version}) ---\n{skill.body}"
+        )
+        request.tools = gate_tools(self.all_tools, skill.allowed_tools)
+        if state is not None and method != "pinned":
+            state["active_skill"] = skill.name
+            state["skill_history"] = state.get("skill_history", []) + [skill.name]
+            state["allowed_tool_names"] = skill.allowed_tools or None
+            state["skill_routing_method"] = method
+        return request
+```
+
+### 13.7 Prompt caching (ganho transversal, ortogonal ao router)
+
+Independente do router, o **system prompt + corpo da skill ativa** é estável entre turnos da mesma jornada. Marcando como cacheável, a Anthropic mantém as KV-keys aquecidas e cobra ~10% do preço normal nos hits, com **TTFT 30–50% menor**:
+
+```python
+from anthropic import Anthropic
+
+client.messages.create(
+    model="claude-opus-4-7",
+    system=[
+        {
+            "type": "text",
+            "text": system_prompt_with_skill_body,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ],
+    messages=[...],
+    tools=gated_tools,
+)
+```
+
+Ortogonal a tudo o resto. **Liga primeiro.**
+
+### 13.8 Validação no CI — garantir que toda skill tem triggers
+
+Skill sem `triggers` cai sempre no fallback LLM, anulando o ganho. O linter do template deve falhar o build se uma skill nova não declarar pelo menos N keywords:
+
+```python
+# scripts/lint_skills.py — adição
+MIN_KEYWORDS_PER_SKILL = 3
+
+def lint_triggers(skill: Skill) -> list[str]:
+    errors = []
+    triggers = skill.triggers or {}
+    kws = triggers.get("keywords", [])
+    if len(kws) < MIN_KEYWORDS_PER_SKILL:
+        errors.append(
+            f"{skill.name}: declarou {len(kws)} keywords, mínimo é {MIN_KEYWORDS_PER_SKILL}. "
+            f"Skills sem triggers caem em fallback LLM e degradam latência."
+        )
+    return errors
+```
+
+### 13.9 Eval de roteamento — antes de subir, mede
+
+Reaproveitando o dataset de §10.2, adicionar asserção de que o **keyword router** (não o LLM) acerta:
+
+```python
+# tests/evals/test_routing.py
+import yaml, pytest, glob
+from agent.skills.keyword_router import KeywordRouter
+from agent.skills.registry import SkillRegistry
+
+@pytest.mark.parametrize("dataset_path", glob.glob("tests/evals/*.yaml"))
+def test_keyword_routing_recall(dataset_path, registry, router):
+    data = yaml.safe_load(open(dataset_path))
+    target_skill = data["skill"]
+    misses = []
+    for example in data["positive_examples"]:
+        if router.route(example) != target_skill:
+            misses.append(example)
+    recall = 1 - len(misses) / len(data["positive_examples"])
+    assert recall >= 0.7, (
+        f"{target_skill}: keyword recall {recall:.0%} (alvo ≥ 70%). "
+        f"Misses: {misses}"
+    )
+```
+
+Recall < 70% no keyword router significa que muitos casos vão pro LLM. Não é falha funcional (o fallback resolve), mas é **dívida de latência** que o time precisa pagar.
+
+### 13.10 Auditoria preservada — `skill_routing_method`
+
+Quando o router determinístico ativa uma skill, **não há `tool_call` no trace**. Isso poderia enfraquecer o pilar de auditoria do ADR §2.4. Mitigação:
+
+1. **Campo `skill_routing_method` no estado** registra a origem: `"pinned" | "keyword" | "embedding" | "llm_tool"`.
+2. **Log estruturado** dentro do middleware emite um evento por ativação:
+   ```python
+   logger.info("skill_activated", extra={
+       "skill": skill.name,
+       "method": method,
+       "matched_triggers": matched,  # quais keywords casaram
+       "session_id": state.get("session_id"),
+       "user_id": state.get("user_id"),
+   })
+   ```
+3. **LangSmith custom event** — `langsmith.client.create_event` para garantir que aparece no trace mesmo sem `tool_call`.
+
+Resultado: o ADR continua íntegro. Você responde "que skill atendeu o cliente X às 14h32 e por qual mecanismo" com query simples.
+
+### 13.11 Quando `tool load_skill` ainda é chamada
+
+Mesmo com o híbrido, a tool **continua existindo e ativa**:
+
+1. **Fallback (camada 3).** Quando o router determinístico não decide, o LLM vê o catálogo e dispara `load_skill`.
+2. **Mudança explícita de skill no meio da conversa.** O usuário diz "na verdade, prefiro falar de cartão". O LLM, com a skill atual ainda pinned, pode emitir `load_skill("cartao-segunda-via")` — a tool despinna a anterior e ativa a nova.
+3. **Skills compostas.** Uma skill que delega para outra (`next_skills`) pode programaticamente acionar a próxima via `load_skill`.
+
+A tool não some. Ela deixa de ser **a única porta** e vira **uma das portas**.
+
+### 13.12 Plano de adoção — em fases
+
+| Fase | Esforço | Latência média esperada |
+|---|---|---|
+| Baseline (atual) | — | 2.95s |
+| **Fase A** Prompt caching | 1 hora | ~2.3s |
+| **Fase B** Skill pinning (§13.4) | 1 dia | ~1.7s |
+| **Fase C** Keyword router (§13.5) | 2–3 dias | ~1.4s |
+| **Fase D** (futuro) Embedding como camada 2 | 1–2 semanas | ~1.35s |
+
+Fases A, B e C entregam ~50% de redução de latência em ~1 sprint, **sem mexer na arquitetura central** descrita nas seções anteriores. Fase D é opcional e só faz sentido depois de medir o que está caindo no fallback em produção real.
+
+### 13.13 Resumo — invariantes preservadas
+
+O Hybrid Router **não enfraquece** nenhuma das invariantes do template:
+
+- ✅ Tool gating continua atômico (aplicado em `_apply_skill`, mesma operação que injeta o corpo).
+- ✅ Auditoria preservada via `skill_routing_method` + log estruturado.
+- ✅ Tool `load_skill` continua existindo como fallback e como porta de troca.
+- ✅ ADR §2.4 segue válido — só ganhou uma camada de short-circuit antes do LLM-router.
+- ✅ SKILL.md continua sendo a fonte da verdade — `triggers` é mais um campo declarativo, revisável por produto/compliance.
+
+A mudança é **operacional** (latência), não **arquitetural** (responsabilidades, governança, escopo das skills). Por isso pode ser adotada incrementalmente sem big-bang refactor.
 
 ---
 
